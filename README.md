@@ -30,6 +30,8 @@ a pantalla completa y **sin conexión**. Todos los documentos y anotaciones se g
 - **Guardado automático** de anotaciones, página y zoom.
 - **Actualización automática**: al abrir la app (o volver a ella) busca la última versión y se recarga sola.
   El número de versión aparece al pie de la biblioteca.
+- **Reparación automática** de PDFs dañados o incompletos (p. ej. descargas cortadas): se recupera todo
+  el contenido que haya llegado y se avisa de que puede faltar una parte.
 - **Exportar** un PDF con las anotaciones incrustadas para compartirlo (Archivos, correo, AirDrop…).
 - Añadir páginas en blanco al final de un documento.
 

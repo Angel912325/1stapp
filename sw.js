@@ -1,10 +1,10 @@
 /* Service worker: permite usar la app sin conexión. */
-const VERSION = 'anota-pdf-1.3.0';
+const VERSION = 'anota-pdf-1.4.0';
 const SHELL = [
   './',
   'index.html',
-  'styles.css?v=1.3.0',
-  'app.js?v=1.3.0',
+  'styles.css?v=1.4.0',
+  'app.js?v=1.4.0',
   'manifest.webmanifest',
   'vendor/pdfjs/pdf.min.js',
   'vendor/pdfjs/pdf.worker.min.js',

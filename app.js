@@ -15,7 +15,7 @@
   };
 
   // Límite de píxeles por canvas (Safari en iPad limita la memoria de canvas).
-  const APP_VERSION = '1.3.0';
+  const APP_VERSION = '1.4.0';
   const THUMB_VER = 2; // sube este número para regenerar las miniaturas de la biblioteca
   const MAX_CANVAS_PIXELS = 8_000_000;
   const MIN_ZOOM = 0.4, MAX_ZOOM = 5;
@@ -502,6 +502,7 @@
           <div class="lib-name"></div>
           <div class="lib-meta">${d.pages} pág. · ${fmtSize(d.size)} · ${fmtDate(d.opened || d.added)}</div>
           ${d.lastPage > 0 ? `<div class="lib-reading">Leyendo: pág. ${d.lastPage + 1} de ${d.pages}</div>` : ''}
+          ${d.repaired === 'truncated' ? '<div class="lib-warn">⚠ Reparado: puede estar incompleto</div>' : ''}
           ${q ? `<div class="lib-path"></div>` : ''}
         </div>`;
       $('.lib-name', card).textContent = d.name;
@@ -604,8 +605,118 @@
     return url;
   }
 
+  // ---------------------------------------------------------------- reparación de PDFs dañados
+  const latin1 = (u8) => new TextDecoder('windows-1252').decode(u8); // 1 carácter por byte
+  const ascii = (str) => { const a = new Uint8Array(str.length); for (let i = 0; i < str.length; i++) a[i] = str.charCodeAt(i) & 0x7f; return a; };
+  function concatBytes(parts) {
+    const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+    let o = 0;
+    for (const p of parts) { out.set(p, o); o += p.length; }
+    return out;
+  }
+
+  /** Descomprime todo lo posible de un flujo deflate aunque esté cortado. */
+  async function inflatePartial(data) {
+    if (typeof DecompressionStream === 'undefined') return null;
+    const ds = new DecompressionStream('deflate');
+    const writer = ds.writable.getWriter();
+    const reader = ds.readable.getReader();
+    const chunks = [];
+    const reading = (async () => {
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+        }
+      } catch (_) { /* fin inesperado del flujo: nos quedamos con lo leído */ }
+    })();
+    try {
+      for (let i = 0; i < data.length; i += 65536) await writer.write(data.subarray(i, i + 65536));
+      await writer.close();
+    } catch (_) { /* datos cortados */ }
+    await reading;
+    return chunks.length ? concatBytes(chunks) : null;
+  }
+
+  async function deflateBytes(data) {
+    if (typeof CompressionStream === 'undefined') return null;
+    try {
+      const stream = new Blob([data]).stream().pipeThrough(new CompressionStream('deflate'));
+      return new Uint8Array(await new Response(stream).arrayBuffer());
+    } catch (_) { return null; }
+  }
+
+  /**
+   * Intenta reparar un PDF incompleto o sin índice (p. ej. una descarga cortada): cierra el último
+   * objeto, recupera el contenido comprimido que haya llegado y reconstruye el final del archivo.
+   * Devuelve { buf, truncated } o null si no es posible.
+   */
+  async function repairPdf(buf) {
+    const u8 = new Uint8Array(buf);
+    const txt = latin1(u8);
+    if (txt.indexOf('%PDF') < 0) return null;
+    const headers = [...txt.matchAll(/(\d+)\s+(\d+)\s+obj\b/g)];
+    if (!headers.length) return null;
+    let body = u8;
+    let truncated = false;
+    const last = headers[headers.length - 1];
+    const lastEndobj = txt.lastIndexOf('endobj');
+    if (last.index > lastEndobj) {
+      truncated = true;
+      const sIdx = txt.indexOf('stream', last.index);
+      const dict = sIdx > 0 ? txt.slice(last.index + last[0].length, sIdx) : '';
+      if (sIdx > 0 && dict.includes('<<')) {
+        let dataStart = sIdx + 6;
+        if (txt[dataStart] === '\r') dataStart++;
+        if (txt[dataStart] === '\n') dataStart++;
+        let data = u8.subarray(dataStart);
+        let newDict = null;
+        if (/\/FlateDecode/.test(dict) && !/\/DecodeParms/.test(dict) && !/\/Filter\s*\[/.test(dict)) {
+          const inflated = await inflatePartial(data);
+          if (inflated && inflated.length) {
+            let cut = inflated.length;
+            for (let i = inflated.length - 1; i >= 0; i--) { if (inflated[i] === 10 || inflated[i] === 13) { cut = i + 1; break; } }
+            data = inflated.subarray(0, cut);
+            newDict = `<</Length ${data.length}>>`;
+            const packed = await deflateBytes(data);
+            if (packed) { data = packed; newDict = `<</Filter/FlateDecode/Length ${data.length}>>`; }
+          }
+        }
+        if (!newDict) newDict = dict.trim().replace(/\/Length\s+\d+(\s+\d+\s+R)?/, `/Length ${data.length}`);
+        body = concatBytes([u8.subarray(0, last.index), ascii(`${last[1]} ${last[2]} obj\n${newDict}\nstream\n`), data, ascii('\nendstream\nendobj\n')]);
+      } else {
+        body = concatBytes([u8.subarray(0, lastEndobj + 6), ascii('\n')]);
+      }
+    }
+    // Busca el catálogo (raíz del documento).
+    let root = null, maxNum = 0;
+    for (let i = 0; i < headers.length; i++) {
+      const h = headers[i];
+      maxNum = Math.max(maxNum, +h[1]);
+      if (root) continue;
+      const end = Math.min(h.index + 4000, i + 1 < headers.length ? headers[i + 1].index : txt.length);
+      if (/\/Type\s*\/Catalog\b/.test(txt.slice(h.index, end))) root = h;
+    }
+    if (!root) return null;
+    const fixed = concatBytes([body, ascii(`\ntrailer\n<</Root ${root[1]} ${root[2]} R/Size ${maxNum + 1}>>\n%%EOF\n`)]);
+    return { buf: fixed.buffer, truncated };
+  }
+
+  const repairNotes = []; // avisos de PDFs reparados durante la importación
+
   async function addDocument(name, buf, folder = targetFolder()) {
-    const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buf.slice(0)), ...PDF_OPTS }).promise;
+    let pdf, repaired = null;
+    try {
+      pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buf.slice(0)), ...PDF_OPTS }).promise;
+    } catch (err) {
+      const fixed = await repairPdf(buf).catch(() => null);
+      if (!fixed) throw err;
+      pdf = await pdfjsLib.getDocument({ data: new Uint8Array(fixed.buf.slice(0)), ...PDF_OPTS }).promise;
+      buf = fixed.buf;
+      repaired = fixed.truncated ? 'truncated' : 'structure';
+      repairNotes.push({ name, repaired });
+    }
     let thumb = null;
     try { thumb = await makeThumb(pdf); } catch (e) { console.warn(e); }
     const pages = pdf.numPages;
@@ -613,7 +724,7 @@
     const id = uid();
     const now = Date.now();
     await DB.put('files', buf, id);
-    await DB.put('docs', { id, name, size: buf.byteLength, pages, thumb, thumbVer: thumb ? THUMB_VER : 0, added: now, opened: 0, folder: folder || null });
+    await DB.put('docs', { id, name, size: buf.byteLength, pages, thumb, thumbVer: thumb ? THUMB_VER : 0, added: now, opened: 0, folder: folder || null, repaired });
     return id;
   }
 
@@ -634,7 +745,19 @@
     }
     busy(false);
     await refreshLibrary();
-    if (failed) toast(failed === 1 ? 'No se pudo abrir un archivo (¿es un PDF válido?)' : `No se pudieron abrir ${failed} archivos`);
+    if (failed) toast(failed === 1 ? 'No se pudo abrir el archivo: está dañado y no se ha podido reparar' : `No se pudieron abrir ${failed} archivos (dañados)`, 5000);
+    if (repairNotes.length) {
+      const notes = repairNotes.splice(0);
+      const anyCut = notes.some((n) => n.repaired === 'truncated');
+      await dialog({
+        title: 'PDF reparado',
+        html: `<p>${notes.map((n) => `<b>${escapeHtml(n.name)}</b>`).join(', ')} ${notes.length > 1 ? 'estaban dañados' : 'estaba dañado'} y se ha${notes.length > 1 ? 'n' : ''} reparado automáticamente.</p>
+               ${anyCut ? `<p>El archivo está <b>incompleto</b> (normalmente porque la descarga se cortó): se ha recuperado todo lo que contenía,
+               pero <b>puede faltar parte del contenido</b>, sobre todo lo que estaba al final.</p>
+               <p class="muted">Para tener el documento completo, vuelve a descargarlo desde su origen e impórtalo de nuevo.</p>` : ''}`,
+        buttons: [{ label: 'Entendido', value: true, cls: 'primary' }],
+      });
+    }
     if (lastId) await openInTab(lastId); // cada archivo importado queda en su propia pestaña
   }
 
