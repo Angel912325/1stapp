@@ -7,6 +7,10 @@ a pantalla completa y **sin conexión**. Todos los documentos y anotaciones se g
 ## Funciones
 
 - **Biblioteca** de PDFs con miniaturas: importar desde Archivos / iCloud Drive, renombrar y eliminar.
+- **Carpetas y subcarpetas** para clasificar los PDFs: crear, renombrar, mover (botón «Mover») y eliminar
+  (al eliminar una carpeta su contenido pasa a la carpeta superior, nunca se borra). Los PDFs que importas
+  dentro de una carpeta se guardan en ella.
+- **Buscador** que encuentra PDFs y carpetas por nombre en toda la biblioteca, indicando en qué carpeta están.
 - **Pestañas**: abre varios documentos a la vez (botón «+» o importando varios archivos) y cambia entre ellos.
   Cada pestaña recuerda su página, zoom y su historial de deshacer; se restauran al volver a abrir la app.
 - **Barra lateral de miniaturas** de las páginas (con tus anotaciones), para saltar a cualquier página.

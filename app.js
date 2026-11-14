@@ -15,7 +15,7 @@
   };
 
   // Límite de píxeles por canvas (Safari en iPad limita la memoria de canvas).
-  const APP_VERSION = '1.2.0';
+  const APP_VERSION = '1.3.0';
   const THUMB_VER = 2; // sube este número para regenerar las miniaturas de la biblioteca
   const MAX_CANVAS_PIXELS = 8_000_000;
   const MIN_ZOOM = 0.4, MAX_ZOOM = 5;
@@ -67,14 +67,22 @@
     db: null,
     open() {
       return new Promise((res, rej) => {
-        const r = indexedDB.open('anota-pdf', 1);
-        r.onupgradeneeded = () => {
+        const r = indexedDB.open('anota-pdf', 2);
+        r.onupgradeneeded = (e) => {
           const db = r.result;
-          db.createObjectStore('docs', { keyPath: 'id' });
-          db.createObjectStore('files');
-          db.createObjectStore('annots');
+          if (e.oldVersion < 1) {
+            db.createObjectStore('docs', { keyPath: 'id' });
+            db.createObjectStore('files');
+            db.createObjectStore('annots');
+          }
+          if (e.oldVersion < 2) db.createObjectStore('folders', { keyPath: 'id' });
         };
-        r.onsuccess = () => { this.db = r.result; res(); };
+        r.onblocked = () => toast('Cierra otras ventanas de Anota PDF para terminar de actualizar', 6000);
+        r.onsuccess = () => {
+          this.db = r.result;
+          this.db.onversionchange = () => this.db.close();
+          res();
+        };
         r.onerror = () => rej(r.error);
       });
     },
@@ -137,6 +145,8 @@
     sel: null,        // { page, id }
     hidden: new Set(),// ids ocultos temporalmente (borrando / moviendo)
     textSize: new Map(),
+    folder: null,     // carpeta abierta en la biblioteca (null = raíz)
+    folders: new Map(), // id -> { id, name, parent, created }
     tabs: [],         // pestañas abiertas: { id, name, undo, redo, zoom, scrollTop, scrollLeft }
   };
 
@@ -144,6 +154,7 @@
   const el = {
     library: $('#library'), reader: $('#reader'),
     libGrid: $('#libGrid'), libEmpty: $('#libEmpty'), fileInput: $('#fileInput'),
+    crumbs: $('#crumbs'), libTitle: $('#libTitle'), libSearch: $('#libSearch'),
     viewer: $('#viewer'), pages: $('#pages'),
     saveState: $('#saveState'),
     tabs: $('#tabs'), sidebar: $('#sidebar'), thumbs: $('#thumbs'), btnSidebar: $('#btnSidebar'),
@@ -193,7 +204,7 @@
       }
       dlg.hidden = false;
       const form = $('#dlgBody input');
-      if (form) {
+      if (form && !form.hasAttribute('data-noenter')) {
         form.addEventListener('keydown', (e) => {
           if (e.key === 'Enter') { e.preventDefault(); actions.lastChild.click(); }
         });
@@ -219,11 +230,270 @@
     return (await DB.all('docs')).sort((a, b) => (b.opened || b.added) - (a.opened || a.added));
   }
 
+  // ---------------------------------------------------------------- carpetas
+  const FOLDER_ICON = '<svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg>';
+  const byName = (a, b) => a.name.localeCompare(b.name, 'es', { numeric: true, sensitivity: 'base' });
+
+  async function loadFolders() {
+    state.folders = new Map((await DB.all('folders')).map((f) => [f.id, f]));
+    if (state.folder && !state.folders.has(state.folder)) state.folder = null;
+  }
+  function folderPath(id) {
+    const path = [];
+    const seen = new Set();
+    while (id && state.folders.has(id) && !seen.has(id)) {
+      seen.add(id);
+      const f = state.folders.get(id);
+      path.unshift(f);
+      id = f.parent || null;
+    }
+    return path;
+  }
+  const folderLabel = (id) => (id && state.folders.has(id) ? folderPath(id).map((f) => f.name).join(' / ') : 'Mis PDFs');
+  function setFolder(id) {
+    state.folder = id || null;
+    try { localStorage.setItem('anota-pdf-folder', state.folder || ''); } catch (_) { /* nada */ }
+    el.libSearch.value = '';
+    refreshLibrary();
+    el.library.scrollTop = 0;
+  }
+  /** Carpeta donde se guardan los PDFs nuevos: la abierta en la biblioteca o la del documento actual. */
+  function targetFolder() {
+    if (!el.reader.hidden && state.doc) return state.doc.folder || null;
+    return state.folder;
+  }
+
+  async function newFolder() {
+    const name = await promptText('Nueva carpeta', '', 'Nombre de la carpeta');
+    if (!name) return;
+    const f = { id: uid(), name, parent: state.folder, created: Date.now() };
+    await DB.put('folders', f);
+    state.folders.set(f.id, f);
+    refreshLibrary();
+  }
+
+  /** Diálogo para elegir carpeta de destino. Devuelve { id } (id null = raíz) o null si se cancela. */
+  async function chooseFolder(title, { current = null, exclude = null } = {}) {
+    const isExcluded = (id) => {
+      if (!exclude) return false;
+      for (let x = id; x; x = (state.folders.get(x) || {}).parent) if (x === exclude) return true;
+      return false;
+    };
+    return dialog({
+      title,
+      html: `<div class="doc-list" id="fdList" style="max-height:45vh"></div>
+             <div class="folder-new"><input type="text" id="fdNew" data-noenter placeholder="Nueva carpeta en Mis PDFs…" autocomplete="off">
+             <button class="btn small" id="fdCreate">Crear</button></div>`,
+      buttons: [{ label: 'Cancelar', value: null }],
+      onOpen: (body, close) => {
+        const list = $('#fdList', body);
+        const render = () => {
+          list.innerHTML = '';
+          const addRow = (id, name, depth) => {
+            const row = document.createElement('div');
+            row.className = 'folder-row' + (id === current ? ' current' : '');
+            row.style.paddingLeft = 10 + depth * 22 + 'px';
+            row.innerHTML = (id ? FOLDER_ICON : '<svg viewBox="0 0 24 24"><path d="M4 11l8-7 8 7v8a1 1 0 01-1 1h-5v-6h-4v6H5a1 1 0 01-1-1z"/></svg>')
+              + '<span class="fr-name"></span>' + (id === current ? '<span class="fr-note">Ubicación actual</span>' : '');
+            $('.fr-name', row).textContent = name;
+            if (isExcluded(id)) row.style.opacity = '.35';
+            else row.addEventListener('click', () => close({ id }));
+            list.appendChild(row);
+          };
+          addRow(null, 'Mis PDFs', 0);
+          const walk = (parent, depth) => {
+            [...state.folders.values()].filter((f) => (f.parent || null) === parent).sort(byName).forEach((f) => {
+              addRow(f.id, f.name, depth);
+              walk(f.id, depth + 1);
+            });
+          };
+          walk(null, 1);
+        };
+        const create = async () => {
+          const name = $('#fdNew', body).value.trim();
+          if (!name) return;
+          const f = { id: uid(), name, parent: null, created: Date.now() };
+          await DB.put('folders', f);
+          state.folders.set(f.id, f);
+          $('#fdNew', body).value = '';
+          render();
+        };
+        $('#fdCreate', body).addEventListener('click', create);
+        $('#fdNew', body).addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); create(); } });
+        render();
+      },
+    });
+  }
+
+  async function moveDoc(d) {
+    const res = await chooseFolder(`Mover «${d.name}» a…`, { current: d.folder || null });
+    if (!res) return;
+    d.folder = res.id;
+    await DB.put('docs', d);
+    if (state.doc && state.doc.id === d.id) state.doc.folder = res.id;
+    toast(`Movido a «${folderLabel(res.id)}»`);
+    refreshLibrary();
+  }
+
+  async function moveFolder(f) {
+    const res = await chooseFolder(`Mover la carpeta «${f.name}» a…`, { current: f.parent || null, exclude: f.id });
+    if (!res) return;
+    f.parent = res.id;
+    await DB.put('folders', f);
+    toast(`Carpeta movida a «${folderLabel(res.id)}»`);
+    refreshLibrary();
+  }
+
+  async function renameFolder(f) {
+    const name = await promptText('Renombrar carpeta', f.name);
+    if (!name) return;
+    f.name = name;
+    await DB.put('folders', f);
+    refreshLibrary();
+  }
+
+  async function deleteFolder(f) {
+    const ok = await dialog({
+      title: 'Eliminar carpeta',
+      html: `<p>¿Eliminar la carpeta <b>${escapeHtml(f.name)}</b>?</p>
+             <p class="muted">Los PDFs y subcarpetas que contiene <b>no se borran</b>: pasan a «${escapeHtml(folderLabel(f.parent))}».</p>`,
+      buttons: [{ label: 'Cancelar', value: false }, { label: 'Eliminar carpeta', value: true, cls: 'primary' }],
+    });
+    if (!ok) return;
+    const parent = f.parent || null;
+    for (const d of await DB.all('docs')) if (d.folder === f.id) { d.folder = parent; await DB.put('docs', d); }
+    for (const c of state.folders.values()) if (c.parent === f.id) { c.parent = parent; await DB.put('folders', c); }
+    await DB.del('folders', f.id);
+    state.folders.delete(f.id);
+    if (state.folder === f.id) state.folder = parent;
+    refreshLibrary();
+  }
+
+  async function deleteDoc(d) {
+    const ok = await dialog({
+      title: 'Eliminar documento',
+      html: `<p>¿Seguro que quieres eliminar <b>${escapeHtml(d.name)}</b> y todas sus anotaciones? No se puede deshacer.</p>`,
+      buttons: [{ label: 'Cancelar', value: false }, { label: 'Eliminar', value: true, cls: 'primary' }],
+    });
+    if (!ok) return;
+    await DB.del('docs', d.id); await DB.del('files', d.id); await DB.del('annots', d.id);
+    state.tabs = state.tabs.filter((t) => t.id !== d.id);
+    saveTabs();
+    refreshLibrary();
+  }
+
+  async function renameDoc(d) {
+    const name = await promptText('Renombrar', d.name);
+    if (!name) return;
+    d.name = name;
+    await DB.put('docs', d);
+    const t = findTab(d.id);
+    if (t) { t.name = name; saveTabs(); }
+    refreshLibrary();
+  }
+
+  /** Menú de opciones de una tarjeta (documento o carpeta). */
+  async function cardMenu(title, items) {
+    const v = await dialog({
+      title,
+      html: '',
+      buttons: [{ label: 'Cancelar', value: null }, ...items.map((it, i) => ({ label: it.label, value: i, cls: it.cls || '' }))],
+    });
+    if (v !== null && v !== undefined) items[v].fn();
+  }
+
+  function cardActions(card, onMove, onMore) {
+    const bar = document.createElement('div');
+    bar.className = 'lib-card-actions';
+    bar.innerHTML = '<button class="mv">Mover</button><button class="more">Más…</button>';
+    $('.mv', bar).addEventListener('click', (e) => { e.stopPropagation(); onMove(); });
+    $('.more', bar).addEventListener('click', (e) => { e.stopPropagation(); onMore(); });
+    card.appendChild(bar);
+  }
+
+  function renderCrumbs() {
+    const path = folderPath(state.folder);
+    el.libTitle.textContent = path.length ? path[path.length - 1].name : 'Mis PDFs';
+    el.crumbs.hidden = !path.length;
+    el.crumbs.innerHTML = '';
+    if (!path.length) return;
+    const add = (label, id) => {
+      const b = document.createElement('button');
+      b.textContent = label;
+      b.addEventListener('click', () => setFolder(id));
+      el.crumbs.appendChild(b);
+      const sep = document.createElement('span');
+      sep.textContent = '›';
+      el.crumbs.appendChild(sep);
+    };
+    add('‹ Mis PDFs', null);
+    path.slice(0, -1).forEach((f) => add(f.name, f.id));
+  }
+
+  async function sortedDocs() {
+    return (await DB.all('docs')).sort((a, b) => (b.opened || b.added) - (a.opened || a.added));
+  }
+
   async function refreshLibrary() {
+    await loadFolders();
     const docs = await sortedDocs();
+    const q = el.libSearch.value.trim().toLowerCase();
+    renderCrumbs();
+    let folders, shown;
+    if (q) {
+      folders = [...state.folders.values()].filter((f) => f.name.toLowerCase().includes(q)).sort(byName);
+      shown = docs.filter((d) => d.name.toLowerCase().includes(q));
+    } else {
+      folders = [...state.folders.values()].filter((f) => (f.parent || null) === state.folder).sort(byName);
+      shown = docs.filter((d) => (d.folder || null) === state.folder);
+    }
     el.libGrid.innerHTML = '';
-    el.libEmpty.hidden = docs.length > 0;
-    for (const d of docs) {
+    const empty = !folders.length && !shown.length;
+    el.libEmpty.hidden = !empty;
+    if (empty) {
+      el.libEmpty.innerHTML = q
+        ? `<div class="lib-empty-icon">🔍</div><p>No hay nada que coincida con «${escapeHtml(el.libSearch.value.trim())}».</p>`
+        : state.folder
+          ? `<div class="lib-empty-icon">📂</div><p>Esta carpeta está vacía.</p>
+             <p class="muted">Pulsa <b>Abrir PDF</b> para importar aquí, o usa <b>Mover</b> en cualquier PDF para traerlo a esta carpeta.</p>`
+          : `<div class="lib-empty-icon">📄</div><p>Todavía no tienes documentos.</p>
+             <p class="muted">Pulsa <b>Abrir PDF</b> para importar un archivo desde Archivos, iCloud Drive, etc.,
+             o crea una <b>Nueva libreta</b> en blanco. Con <b>Nueva carpeta</b> puedes organizarlos.</p>`;
+    }
+
+    for (const f of folders) {
+      const inDocs = docs.filter((d) => d.folder === f.id);
+      const subs = [...state.folders.values()].filter((c) => c.parent === f.id).length;
+      const card = document.createElement('div');
+      card.className = 'lib-card folder-card';
+      card.dataset.folder = f.id;
+      const parts = [];
+      parts.push(inDocs.length === 1 ? '1 PDF' : `${inDocs.length} PDFs`);
+      if (subs) parts.push(subs === 1 ? '1 carpeta' : `${subs} carpetas`);
+      card.innerHTML = `
+        <div class="lib-thumb">
+          <svg class="folder-svg" viewBox="0 0 64 52"><path class="back" d="M4 8a4 4 0 014-4h15l6 6h27a4 4 0 014 4v30a4 4 0 01-4 4H8a4 4 0 01-4-4z"/>
+          <path class="front" d="M4 17a3 3 0 013-3h50a3 3 0 013 3v27a4 4 0 01-4 4H8a4 4 0 01-4-4z"/></svg>
+          <div class="folder-peek"></div>
+        </div>
+        <div class="lib-info">
+          <div class="lib-name"></div>
+          <div class="lib-meta">${parts.join(' · ')}</div>
+          ${q ? `<div class="lib-path"></div>` : ''}
+        </div>`;
+      $('.lib-name', card).textContent = f.name;
+      if (q) $('.lib-path', card).textContent = '📁 ' + folderLabel(f.parent);
+      const peek = $('.folder-peek', card);
+      inDocs.slice(0, 3).forEach((d) => { if (d.thumb) { const img = document.createElement('img'); img.src = d.thumb; img.alt = ''; peek.appendChild(img); } });
+      card.addEventListener('click', () => setFolder(f.id));
+      cardActions(card, () => moveFolder(f), () => cardMenu(f.name, [
+        { label: 'Renombrar', fn: () => renameFolder(f) },
+        { label: 'Eliminar carpeta', cls: 'danger', fn: () => deleteFolder(f) },
+      ]));
+      el.libGrid.appendChild(card);
+    }
+
+    for (const d of shown) {
       const card = document.createElement('div');
       card.className = 'lib-card';
       card.innerHTML = `
@@ -232,39 +502,17 @@
           <div class="lib-name"></div>
           <div class="lib-meta">${d.pages} pág. · ${fmtSize(d.size)} · ${fmtDate(d.opened || d.added)}</div>
           ${d.lastPage > 0 ? `<div class="lib-reading">Leyendo: pág. ${d.lastPage + 1} de ${d.pages}</div>` : ''}
-        </div>
-        <div class="lib-card-actions">
-          <button class="ren">Renombrar</button>
-          <button class="del">Eliminar</button>
+          ${q ? `<div class="lib-path"></div>` : ''}
         </div>`;
       $('.lib-name', card).textContent = d.name;
+      if (q) $('.lib-path', card).textContent = '📁 ' + folderLabel(d.folder);
       card.dataset.id = d.id;
       setThumbImg($('.lib-thumb img', card), d.thumb);
       card.addEventListener('click', () => openInTab(d.id));
-      $('.ren', card).addEventListener('click', async (e) => {
-        e.stopPropagation();
-        const name = await promptText('Renombrar', d.name);
-        if (name) {
-          d.name = name;
-          await DB.put('docs', d);
-          const t = findTab(d.id);
-          if (t) { t.name = name; saveTabs(); }
-          refreshLibrary();
-        }
-      });
-      $('.del', card).addEventListener('click', async (e) => {
-        e.stopPropagation();
-        const ok = await dialog({
-          title: 'Eliminar documento',
-          html: `<p>¿Seguro que quieres eliminar <b>${escapeHtml(d.name)}</b> y todas sus anotaciones? No se puede deshacer.</p>`,
-          buttons: [{ label: 'Cancelar', value: false }, { label: 'Eliminar', value: true, cls: 'primary' }],
-        });
-        if (!ok) return;
-        await DB.del('docs', d.id); await DB.del('files', d.id); await DB.del('annots', d.id);
-        state.tabs = state.tabs.filter((t) => t.id !== d.id);
-        saveTabs();
-        refreshLibrary();
-      });
+      cardActions(card, () => moveDoc(d), () => cardMenu(d.name, [
+        { label: 'Renombrar', fn: () => renameDoc(d) },
+        { label: 'Eliminar', cls: 'danger', fn: () => deleteDoc(d) },
+      ]));
       el.libGrid.appendChild(card);
     }
     regenThumbs();
@@ -356,7 +604,7 @@
     return url;
   }
 
-  async function addDocument(name, buf) {
+  async function addDocument(name, buf, folder = targetFolder()) {
     const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buf.slice(0)), ...PDF_OPTS }).promise;
     let thumb = null;
     try { thumb = await makeThumb(pdf); } catch (e) { console.warn(e); }
@@ -365,7 +613,7 @@
     const id = uid();
     const now = Date.now();
     await DB.put('files', buf, id);
-    await DB.put('docs', { id, name, size: buf.byteLength, pages, thumb, thumbVer: thumb ? THUMB_VER : 0, added: now, opened: 0 });
+    await DB.put('docs', { id, name, size: buf.byteLength, pages, thumb, thumbVer: thumb ? THUMB_VER : 0, added: now, opened: 0, folder: folder || null });
     return id;
   }
 
@@ -660,7 +908,7 @@
     const row = document.createElement('div');
     row.className = 'doc-row';
     row.innerHTML = `<div class="dr-thumb"><img alt="" hidden></div>
-      <div class="dr-text"><div class="dr-name"></div><div class="dr-meta">${d.pages} pág. · ${fmtSize(d.size)}</div></div>
+      <div class="dr-text"><div class="dr-name"></div><div class="dr-meta">${d.folder ? '📁 ' + escapeHtml(folderLabel(d.folder)) + ' · ' : ''}${d.pages} pág. · ${fmtSize(d.size)}</div></div>
       ${badge ? `<span class="dr-badge">${escapeHtml(badge)}</span>` : ''}`;
     $('.dr-name', row).textContent = d.name;
     setThumbImg($('.dr-thumb img', row), d.thumb);
@@ -2155,6 +2403,9 @@
     });
     $('#btnNewNotebook').addEventListener('click', newNotebook);
     $('#btnMerge').addEventListener('click', () => mergeDialog([]));
+    $('#btnNewFolder').addEventListener('click', newFolder);
+    let searchTimer = 0;
+    el.libSearch.addEventListener('input', () => { clearTimeout(searchTimer); searchTimer = setTimeout(refreshLibrary, 150); });
     $('#btnTabAdd').addEventListener('click', openPicker);
     el.btnSidebar.addEventListener('click', toggleSidebar);
 
@@ -2294,6 +2545,7 @@
       return;
     }
     if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+    try { state.folder = localStorage.getItem('anota-pdf-folder') || null; } catch (_) { /* nada */ }
     bindEvents();
     setTool(state.settings.tool);
     updateTouchAction();
