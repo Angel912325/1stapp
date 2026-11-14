@@ -7,6 +7,11 @@ a pantalla completa y **sin conexión**. Todos los documentos y anotaciones se g
 ## Funciones
 
 - **Biblioteca** de PDFs con miniaturas: importar desde Archivos / iCloud Drive, renombrar y eliminar.
+- **Pestañas**: abre varios documentos a la vez (botón «+» o importando varios archivos) y cambia entre ellos.
+  Cada pestaña recuerda su página, zoom y su historial de deshacer; se restauran al volver a abrir la app.
+- **Barra lateral de miniaturas** de las páginas (con tus anotaciones), para saltar a cualquier página.
+  Se muestra en documentos de varias páginas y se oculta con el botón junto a la flecha de volver.
+- **Juntar PDFs** en uno nuevo, eligiendo el orden. Las anotaciones se conservan y siguen siendo editables.
 - **Nueva libreta** en blanco, rayada o cuadriculada para tomar notas desde cero.
 - **Bolígrafo** sensible a la presión del Apple Pencil, con colores y grosor ajustables.
 - **Subrayador** translúcido que no tapa el texto.

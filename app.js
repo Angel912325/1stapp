@@ -97,6 +97,7 @@
     shapeKind: 'rect',
     pencilOnly: false,
     penDetected: false,
+    sidebar: true,
     tools: {
       pen: { color: '#1a1a1a', width: 2 },
       highlighter: { color: '#ffeb3b', width: 14 },
@@ -134,6 +135,7 @@
     sel: null,        // { page, id }
     hidden: new Set(),// ids ocultos temporalmente (borrando / moviendo)
     textSize: new Map(),
+    tabs: [],         // pestañas abiertas: { id, name, undo, redo, zoom, scrollTop, scrollLeft }
   };
 
   // ---------------------------------------------------------------- elementos
@@ -141,7 +143,8 @@
     library: $('#library'), reader: $('#reader'),
     libGrid: $('#libGrid'), libEmpty: $('#libEmpty'), fileInput: $('#fileInput'),
     viewer: $('#viewer'), pages: $('#pages'),
-    docTitle: $('#docTitle'), saveState: $('#saveState'),
+    saveState: $('#saveState'),
+    tabs: $('#tabs'), sidebar: $('#sidebar'), thumbs: $('#thumbs'), btnSidebar: $('#btnSidebar'),
     btnUndo: $('#btnUndo'), btnRedo: $('#btnRedo'),
     zoomLabel: $('#btnZoomFit'), pageLabel: $('#btnPage'),
     colors: $('#colors'), customColor: $('#customColor'),
@@ -167,6 +170,7 @@
   }
 
   /** Muestra un diálogo. buttons: [{label, value, cls}]. Devuelve el valor del botón pulsado. */
+  const KEEP_OPEN = Symbol('keep-open');
   function dialog({ title, html = '', buttons = [{ label: 'Aceptar', value: true, cls: 'primary' }], onOpen }) {
     return new Promise((resolve) => {
       const dlg = $('#dialog');
@@ -179,7 +183,10 @@
         const btn = document.createElement('button');
         btn.className = 'btn ' + (b.cls || '');
         btn.textContent = b.label;
-        btn.onclick = () => close(typeof b.value === 'function' ? b.value() : b.value);
+        btn.onclick = () => {
+          const v = typeof b.value === 'function' ? b.value() : b.value;
+          if (v !== KEEP_OPEN) close(v);
+        };
         actions.appendChild(btn);
       }
       dlg.hidden = false;
@@ -189,7 +196,7 @@
           if (e.key === 'Enter') { e.preventDefault(); actions.lastChild.click(); }
         });
       }
-      if (onOpen) onOpen($('#dlgBody'));
+      if (onOpen) onOpen($('#dlgBody'), close);
     });
   }
 
@@ -206,8 +213,12 @@
   }
 
   // ================================================================ BIBLIOTECA
+  async function sortedDocs() {
+    return (await DB.all('docs')).sort((a, b) => (b.opened || b.added) - (a.opened || a.added));
+  }
+
   async function refreshLibrary() {
-    const docs = (await DB.all('docs')).sort((a, b) => (b.opened || b.added) - (a.opened || a.added));
+    const docs = await sortedDocs();
     el.libGrid.innerHTML = '';
     el.libEmpty.hidden = docs.length > 0;
     for (const d of docs) {
@@ -225,11 +236,17 @@
         </div>`;
       $('.lib-name', card).textContent = d.name;
       if (d.thumb) $('.lib-thumb', card).style.backgroundImage = `url("${d.thumb}")`;
-      card.addEventListener('click', () => openDoc(d.id));
+      card.addEventListener('click', () => openInTab(d.id));
       $('.ren', card).addEventListener('click', async (e) => {
         e.stopPropagation();
         const name = await promptText('Renombrar', d.name);
-        if (name) { d.name = name; await DB.put('docs', d); refreshLibrary(); }
+        if (name) {
+          d.name = name;
+          await DB.put('docs', d);
+          const t = findTab(d.id);
+          if (t) { t.name = name; saveTabs(); }
+          refreshLibrary();
+        }
       });
       $('.del', card).addEventListener('click', async (e) => {
         e.stopPropagation();
@@ -240,6 +257,8 @@
         });
         if (!ok) return;
         await DB.del('docs', d.id); await DB.del('files', d.id); await DB.del('annots', d.id);
+        state.tabs = state.tabs.filter((t) => t.id !== d.id);
+        saveTabs();
         refreshLibrary();
       });
       el.libGrid.appendChild(card);
@@ -280,7 +299,9 @@
     for (const f of files) {
       try {
         const buf = await f.arrayBuffer();
-        lastId = await addDocument(f.name.replace(/\.pdf$/i, ''), buf);
+        const name = f.name.replace(/\.pdf$/i, '');
+        lastId = await addDocument(name, buf);
+        ensureTab(lastId, name);
       } catch (e) {
         console.error(e);
         failed++;
@@ -289,7 +310,7 @@
     busy(false);
     await refreshLibrary();
     if (failed) toast(failed === 1 ? 'No se pudo abrir un archivo (¿es un PDF válido?)' : `No se pudieron abrir ${failed} archivos`);
-    if (files.length === 1 && lastId) openDoc(lastId);
+    if (lastId) await openInTab(lastId); // cada archivo importado queda en su propia pestaña
   }
 
   async function newNotebook() {
@@ -329,7 +350,7 @@
       const id = await addDocument(res.name, bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
       busy(false);
       await refreshLibrary();
-      openDoc(id);
+      openInTab(id);
     } catch (e) {
       busy(false);
       console.error(e);
@@ -367,7 +388,8 @@
       state.bytes = buf;
       state.pdf = pdf;
       state.annots = (ann && ann.pages) || {};
-      if (!opts.keepHistory) { state.undo = []; state.redo = []; }
+      state.undo = opts.undo || [];
+      state.redo = opts.redo || [];
       state.sel = null;
       state.hidden.clear();
       state.textSize.clear();
@@ -384,26 +406,31 @@
       }
       state.pages = pages;
       buildPagesDom();
+      buildThumbs();
 
-      el.docTitle.textContent = rec.name;
       el.library.hidden = true;
       el.reader.hidden = false;
       setSaveState('');
+      renderTabs();
+      applySidebar();
 
       state.zoom = opts.zoom || rec.zoom || 1;
       layout();
       const startPage = opts.page != null ? opts.page : (rec.lastPage || 0);
       if (startPage > 0 && pages[startPage]) el.viewer.scrollTop = pages[startPage].el.offsetTop - 8;
       if (opts.scrollTop != null) el.viewer.scrollTop = opts.scrollTop;
+      if (opts.scrollLeft != null) el.viewer.scrollLeft = opts.scrollLeft;
       updatePageLabel();
       updateUndoButtons();
 
       rec.opened = Date.now();
       rec.pages = pdf.numPages;
       DB.put('docs', rec);
+      return true;
     } catch (e) {
       console.error(e);
       toast('No se pudo abrir el documento');
+      return false;
     } finally {
       busy(false);
     }
@@ -411,6 +438,11 @@
 
   function closeReaderInternals() {
     if (io) { io.disconnect(); io = null; }
+    if (thumbIO) { thumbIO.disconnect(); thumbIO = null; }
+    for (const pg of state.pages) {
+      if (pg.thumb) { pg.thumb.canvas.width = pg.thumb.canvas.height = 0; if (pg.thumb.base) pg.thumb.base.width = pg.thumb.base.height = 0; }
+    }
+    el.thumbs.innerHTML = '';
     for (const pg of state.pages) {
       if (pg.renderTask) pg.renderTask.cancel();
       if (pg.pdfCanvas) pg.pdfCanvas.width = pg.pdfCanvas.height = 0;
@@ -423,14 +455,402 @@
   }
 
   async function closeReader() {
-    endEditing();
-    await flushSave();
-    saveViewState();
+    await stashCurrent();
+    showLibrary();
+  }
+
+  function showLibrary() {
     closeReaderInternals();
     state.doc = null;
     el.reader.hidden = true;
     el.library.hidden = false;
+    saveTabs();
     refreshLibrary();
+  }
+
+  // ================================================================ PESTAÑAS
+  const findTab = (id) => state.tabs.find((t) => t.id === id);
+
+  function saveTabs() {
+    try {
+      localStorage.setItem('anota-pdf-tabs', JSON.stringify({
+        tabs: state.tabs.map((t) => ({ id: t.id, name: t.name })),
+        active: state.doc ? state.doc.id : null,
+      }));
+    } catch (_) { /* sin almacenamiento */ }
+  }
+
+  async function restoreTabs() {
+    let data = null;
+    try { data = JSON.parse(localStorage.getItem('anota-pdf-tabs') || 'null'); } catch (_) { /* nada */ }
+    if (!data || !Array.isArray(data.tabs)) return;
+    const existing = new Map((await DB.all('docs')).map((d) => [d.id, d]));
+    state.tabs = data.tabs.filter((t) => existing.has(t.id))
+      .map((t) => ({ id: t.id, name: existing.get(t.id).name, undo: [], redo: [] }));
+    if (data.active && findTab(data.active)) await openInTab(data.active);
+  }
+
+  /** Crea la pestaña si no existe (sin abrirla). */
+  function ensureTab(id, name) {
+    let t = findTab(id);
+    if (!t) {
+      t = { id, name, undo: [], redo: [] };
+      state.tabs.push(t);
+    }
+    return t;
+  }
+
+  /** Guarda el estado de la pestaña activa (historial, zoom, posición) y sus anotaciones. */
+  async function stashCurrent() {
+    if (!state.doc) return;
+    endEditing();
+    const t = findTab(state.doc.id);
+    if (t) {
+      t.undo = state.undo; t.redo = state.redo; t.zoom = state.zoom;
+      t.scrollTop = el.viewer.scrollTop; t.scrollLeft = el.viewer.scrollLeft;
+    }
+    await flushSave();
+    saveViewState();
+  }
+
+  async function openInTab(id) {
+    if (state.doc && state.doc.id === id && !el.reader.hidden) return;
+    let t = findTab(id);
+    if (!t) {
+      const rec = await DB.get('docs', id);
+      if (!rec) return;
+      t = ensureTab(id, rec.name);
+    }
+    await stashCurrent();
+    const ok = await openDoc(id, { undo: t.undo, redo: t.redo, zoom: t.zoom, scrollTop: t.scrollTop, scrollLeft: t.scrollLeft });
+    if (!ok) state.tabs = state.tabs.filter((x) => x !== t);
+    renderTabs();
+    saveTabs();
+  }
+
+  async function closeTab(id) {
+    const i = state.tabs.findIndex((t) => t.id === id);
+    if (i < 0) return;
+    const active = state.doc && state.doc.id === id;
+    if (active) await stashCurrent();
+    state.tabs.splice(i, 1);
+    if (active) {
+      const next = state.tabs[i] || state.tabs[i - 1];
+      if (next) {
+        state.doc = null; // ya guardado: no volver a guardar la pestaña cerrada
+        await openInTab(next.id);
+      } else {
+        showLibrary();
+      }
+    }
+    renderTabs();
+    saveTabs();
+  }
+
+  function renderTabs() {
+    el.tabs.innerHTML = '';
+    for (const t of state.tabs) {
+      const b = document.createElement('div');
+      b.className = 'tab' + (state.doc && state.doc.id === t.id ? ' active' : '');
+      b.title = t.name;
+      b.innerHTML = '<span class="tab-name"></span><button class="tab-close" aria-label="Cerrar pestaña">×</button>';
+      $('.tab-name', b).textContent = t.name;
+      b.addEventListener('click', (e) => {
+        if (e.target.closest('.tab-close')) closeTab(t.id);
+        else openInTab(t.id);
+      });
+      el.tabs.appendChild(b);
+    }
+    const a = $('.tab.active', el.tabs);
+    if (a) {
+      const L = a.offsetLeft, R = L + a.offsetWidth;
+      if (L < el.tabs.scrollLeft || R > el.tabs.scrollLeft + el.tabs.clientWidth) el.tabs.scrollLeft = L - 20;
+    }
+  }
+
+  function docRow(d, badge = '') {
+    const row = document.createElement('div');
+    row.className = 'doc-row';
+    row.innerHTML = `<div class="dr-thumb"></div>
+      <div class="dr-text"><div class="dr-name"></div><div class="dr-meta">${d.pages} pág. · ${fmtSize(d.size)}</div></div>
+      ${badge ? `<span class="dr-badge">${escapeHtml(badge)}</span>` : ''}`;
+    $('.dr-name', row).textContent = d.name;
+    if (d.thumb) $('.dr-thumb', row).style.backgroundImage = `url("${d.thumb}")`;
+    return row;
+  }
+
+  /** Botón «+» de la barra de pestañas: abrir otro documento. */
+  async function openPicker() {
+    endEditing();
+    const docs = await sortedDocs();
+    const res = await dialog({
+      title: 'Abrir en una pestaña nueva',
+      html: `<label class="btn primary block">Importar desde Archivos / iCloud Drive…
+               <input type="file" id="pickFile" accept="application/pdf,.pdf" multiple hidden></label>
+             <h3 class="dlg-sub">Mis PDFs</h3>
+             <div class="doc-list" id="pickList"></div>`,
+      buttons: [{ label: 'Cancelar', value: null }],
+      onOpen: (body, close) => {
+        const list = $('#pickList', body);
+        if (!docs.length) list.innerHTML = '<p class="muted small">La biblioteca está vacía.</p>';
+        for (const d of docs) {
+          const row = docRow(d, findTab(d.id) ? (state.doc && state.doc.id === d.id ? 'Actual' : 'Abierto') : '');
+          row.addEventListener('click', () => close({ id: d.id }));
+          list.appendChild(row);
+        }
+        $('#pickFile', body).addEventListener('change', (e) => close({ files: [...e.target.files] }));
+      },
+    });
+    if (!res) return;
+    if (res.files) importFiles(res.files);
+    else if (res.id) openInTab(res.id);
+  }
+
+  // ================================================================ JUNTAR PDFs
+  async function mergeDialog(preselect = []) {
+    endEditing();
+    const all = await sortedDocs();
+    const byId = new Map(all.map((d) => [d.id, d]));
+    const selected = preselect.filter((id) => byId.has(id));
+    const res = await dialog({
+      title: 'Juntar PDFs',
+      html: `<p class="muted small">Elige los documentos en el orden en que quieres unirlos. Se creará un PDF nuevo
+               (los originales no cambian) y las anotaciones se conservan y siguen siendo editables.</p>
+             <p><input type="text" id="mgName" value="Documento combinado" autocomplete="off"></p>
+             <h3 class="dlg-sub">Orden del nuevo PDF</h3>
+             <div class="doc-list" id="mgSel"></div>
+             <h3 class="dlg-sub">Añadir documentos</h3>
+             <label class="btn block">Importar desde Archivos / iCloud Drive…
+               <input type="file" id="mgFile" accept="application/pdf,.pdf" multiple hidden></label>
+             <div class="doc-list" id="mgAll"></div>`,
+      buttons: [
+        { label: 'Cancelar', value: null },
+        {
+          label: 'Juntar', cls: 'primary',
+          value: () => {
+            if (selected.length < 2) { toast('Elige al menos dos documentos (puede ser el mismo dos veces)'); return KEEP_OPEN; }
+            return { name: $('#mgName').value.trim() || 'Documento combinado', ids: selected.slice() };
+          },
+        },
+      ],
+      onOpen: (body) => {
+        const selBox = $('#mgSel', body), allBox = $('#mgAll', body);
+        const renderSel = () => {
+          selBox.innerHTML = '';
+          if (!selected.length) { selBox.innerHTML = '<p class="muted small">Toca los documentos de abajo para añadirlos.</p>'; return; }
+          const total = selected.reduce((n, id) => n + (byId.get(id).pages || 0), 0);
+          selected.forEach((id, i) => {
+            const row = docRow(byId.get(id));
+            row.style.cursor = 'default';
+            const num = document.createElement('span');
+            num.className = 'dr-num'; num.textContent = i + 1;
+            row.prepend(num);
+            const mk = (txt, title, fn, disabled) => {
+              const b = document.createElement('button');
+              b.className = 'mini'; b.textContent = txt; b.title = title; b.disabled = !!disabled;
+              b.addEventListener('click', (e) => { e.stopPropagation(); fn(); renderSel(); });
+              row.appendChild(b);
+            };
+            mk('↑', 'Subir', () => { [selected[i - 1], selected[i]] = [selected[i], selected[i - 1]]; }, i === 0);
+            mk('↓', 'Bajar', () => { [selected[i + 1], selected[i]] = [selected[i], selected[i + 1]]; }, i === selected.length - 1);
+            mk('✕', 'Quitar', () => { selected.splice(i, 1); });
+            selBox.appendChild(row);
+          });
+          const info = document.createElement('p');
+          info.className = 'muted small';
+          info.textContent = `Total: ${total} páginas`;
+          selBox.appendChild(info);
+        };
+        const renderAll = () => {
+          allBox.innerHTML = '';
+          if (!all.length) allBox.innerHTML = '<p class="muted small">La biblioteca está vacía: importa algún PDF.</p>';
+          for (const d of all) {
+            const row = docRow(d, '＋');
+            row.addEventListener('click', () => { selected.push(d.id); renderSel(); });
+            allBox.appendChild(row);
+          }
+        };
+        $('#mgFile', body).addEventListener('change', async (e) => {
+          const files = [...e.target.files];
+          e.target.value = '';
+          busy(true, 'Importando…');
+          for (const f of files) {
+            try {
+              const id = await addDocument(f.name.replace(/\.pdf$/i, ''), await f.arrayBuffer());
+              const rec = await DB.get('docs', id);
+              all.unshift(rec); byId.set(id, rec); selected.push(id);
+            } catch (err) {
+              console.error(err);
+              toast('No se pudo importar ' + f.name);
+            }
+          }
+          busy(false);
+          renderSel(); renderAll();
+          refreshLibrary();
+        });
+        renderSel(); renderAll();
+      },
+    });
+    if (res) await mergeDocs(res.name, res.ids);
+  }
+
+  async function mergeDocs(name, ids) {
+    await stashCurrent(); // guarda las anotaciones pendientes del documento abierto
+    busy(true, 'Juntando PDFs…');
+    try {
+      const { PDFDocument } = PDFLib;
+      const out = await PDFDocument.create();
+      const annots = {};
+      let offset = 0;
+      for (const id of ids) {
+        const buf = await DB.get('files', id);
+        const src = await PDFDocument.load(buf.slice(0), { ignoreEncryption: true });
+        const copied = await out.copyPages(src, src.getPageIndices());
+        copied.forEach((p) => out.addPage(p));
+        const a = await DB.get('annots', id);
+        for (const [k, list] of Object.entries((a && a.pages) || {})) {
+          annots[offset + Number(k)] = list.map((it) => ({ ...it, id: uid() }));
+        }
+        offset += copied.length;
+      }
+      const bytes = await out.save();
+      const newId = await addDocument(name, bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+      if (Object.keys(annots).length) await DB.put('annots', { pages: annots, updated: Date.now() }, newId);
+      busy(false);
+      await refreshLibrary();
+      await openInTab(newId);
+      toast(`PDF combinado creado: ${offset} páginas`);
+    } catch (e) {
+      console.error(e);
+      busy(false);
+      toast('No se pudieron juntar los PDFs (alguno puede estar protegido con contraseña)');
+    }
+  }
+
+  // ================================================================ MINIATURAS
+  const THUMB_W = 100;
+  let thumbIO = null;
+  let activeThumb = -1;
+
+  function applySidebar() {
+    const show = !!state.settings.sidebar && state.pages.length > 1;
+    el.sidebar.hidden = !show;
+    el.btnSidebar.classList.toggle('on', show);
+  }
+
+  function toggleSidebar() {
+    state.settings.sidebar = !state.settings.sidebar;
+    if (state.pages.length <= 1 && state.settings.sidebar) toast('Este documento solo tiene una página');
+    saveSettings();
+    applySidebar();
+    zoomCentered(state.zoom);
+    activeThumb = -1;
+    updatePageLabel();
+  }
+
+  function buildThumbs() {
+    el.thumbs.innerHTML = '';
+    activeThumb = -1;
+    thumbIO = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        const pg = state.pages[+e.target.dataset.index];
+        if (!pg || !pg.thumb) continue;
+        pg.thumb.visible = e.isIntersecting;
+        if (!e.isIntersecting && pg.thumb.base) {
+          pg.thumb.base.width = pg.thumb.base.height = 0;
+          pg.thumb.base = null;
+          pg.thumb.canvas.width = pg.thumb.canvas.height = 0;
+        }
+      }
+      scheduleRender();
+    }, { root: el.sidebar, rootMargin: '400px 0px' });
+    for (const pg of state.pages) {
+      const d = document.createElement('div');
+      d.className = 'thumb';
+      d.dataset.index = pg.index;
+      const box = document.createElement('div');
+      box.className = 'tpage';
+      box.style.width = THUMB_W + 'px';
+      box.style.height = Math.round((THUMB_W * pg.h) / pg.w) + 'px';
+      const c = document.createElement('canvas');
+      box.appendChild(c);
+      const n = document.createElement('span');
+      n.className = 'tnum';
+      n.textContent = pg.index + 1;
+      d.append(box, n);
+      d.addEventListener('click', () => goTo(pg.index));
+      el.thumbs.appendChild(d);
+      pg.thumb = { el: d, canvas: c, base: null, visible: false };
+      thumbIO.observe(d);
+    }
+  }
+
+  function nextThumbToRender() {
+    if (el.sidebar.hidden) return null;
+    for (const pg of state.pages) if (pg.thumb && pg.thumb.visible && !pg.thumb.base) return pg;
+    return null;
+  }
+
+  async function renderThumb(pg) {
+    const t = pg.thumb;
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    const base = document.createElement('canvas');
+    base.width = Math.round(THUMB_W * dpr);
+    base.height = Math.round(((THUMB_W * pg.h) / pg.w) * dpr);
+    const ctx = base.getContext('2d', { alpha: false });
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, base.width, base.height);
+    t.base = base; // marcada como en curso para no repetirla
+    try {
+      await pg.pdfPage.render({ canvasContext: ctx, viewport: pg.pdfPage.getViewport({ scale: base.width / pg.w }) }).promise;
+    } catch (e) {
+      console.warn(e);
+    }
+    if (t.base !== base) { base.width = base.height = 0; return; }
+    composeThumb(pg);
+  }
+
+  /** Dibuja la miniatura: página + anotaciones. */
+  function composeThumb(pg) {
+    const t = pg.thumb;
+    if (!t || !t.base || !t.base.width) return;
+    const c = t.canvas;
+    c.width = t.base.width;
+    c.height = t.base.height;
+    const ctx = c.getContext('2d');
+    ctx.drawImage(t.base, 0, 0);
+    const k = c.width / pg.w;
+    ctx.setTransform(k, 0, 0, k, 0, 0);
+    ctx.globalCompositeOperation = 'multiply';
+    const items = state.annots[pg.index] || [];
+    for (const it of items) if (it.tool === 'highlighter') drawItem(ctx, it);
+    for (const it of items) if (it.tool !== 'highlighter') drawItem(ctx, it);
+    for (const it of items) {
+      if (it.type !== 'text') continue;
+      ctx.fillStyle = it.color;
+      ctx.font = `${it.size}px Helvetica, Arial, sans-serif`;
+      it.text.split('\n').forEach((line, i) => ctx.fillText(line, it.x, it.y + it.size * (TEXT_BASELINE + 1.2 * i)));
+    }
+  }
+
+  function highlightThumb(index) {
+    if (index === activeThumb) return;
+    const prev = state.pages[activeThumb];
+    if (prev && prev.thumb) prev.thumb.el.classList.remove('active');
+    activeThumb = index;
+    const pg = state.pages[index];
+    if (!pg || !pg.thumb) return;
+    pg.thumb.el.classList.add('active');
+    if (el.sidebar.hidden) return;
+    const r = pg.thumb.el, s = el.sidebar;
+    if (r.offsetTop < s.scrollTop || r.offsetTop + r.offsetHeight > s.scrollTop + s.clientHeight) {
+      s.scrollTop = r.offsetTop - s.clientHeight / 2 + r.offsetHeight / 2;
+    }
+  }
+
+  function goTo(index) {
+    const pg = state.pages[clamp(index, 0, state.pages.length - 1)];
+    if (pg) el.viewer.scrollTop = pg.el.offsetTop - 8;
   }
 
   function buildPagesDom() {
@@ -485,8 +905,13 @@
       for (;;) {
         if (pinch) break;
         const pg = nextPageToRender();
-        if (!pg) break;
-        try { await renderPage(pg); } catch (e) { console.error(e); pg.renderKey = desiredKey(pg); }
+        if (pg) {
+          try { await renderPage(pg); } catch (e) { console.error(e); pg.renderKey = desiredKey(pg); }
+          continue;
+        }
+        const th = nextThumbToRender();
+        if (!th) break;
+        await renderThumb(th);
       }
     } finally {
       rendering = false;
@@ -591,7 +1016,9 @@
     return pg ? pg.index : 0;
   }
   function updatePageLabel() {
-    el.pageLabel.textContent = `${currentPageIndex() + 1} / ${state.pages.length}`;
+    const idx = currentPageIndex();
+    el.pageLabel.textContent = `${idx + 1} / ${state.pages.length}`;
+    highlightThumb(idx);
   }
 
   // ---- dibujo de anotaciones
@@ -800,6 +1227,7 @@
   function setPageItems(index, list) {
     if (list.length) state.annots[index] = list; else delete state.annots[index];
     redrawPage(index);
+    if (state.pages[index]) composeThumb(state.pages[index]);
     if (state.sel && !findItem(state.sel.page, state.sel.id)) setSelection(null);
     else showSelection();
     scheduleSave();
@@ -1564,7 +1992,7 @@
       const id = state.doc.id;
       const newIndex = state.pages.length;
       busy(false);
-      await openDoc(id, { keepHistory: true, zoom: state.zoom, page: newIndex });
+      await openDoc(id, { undo: state.undo, redo: state.redo, zoom: state.zoom, page: newIndex });
       toast('Página añadida al final');
     } catch (e) {
       console.error(e);
@@ -1601,7 +2029,8 @@
 
   async function onMenuAction(act) {
     toggleMenu(false);
-    if (act === 'addPage') addBlankPage();
+    if (act === 'merge') mergeDialog([state.doc.id]);
+    else if (act === 'addPage') addBlankPage();
     else if (act === 'clearPage') {
       const idx = currentPageIndex();
       if (!(state.annots[idx] || []).length) { toast('Esta página no tiene anotaciones'); return; }
@@ -1612,7 +2041,10 @@
       const name = await promptText('Renombrar documento', state.doc.name);
       if (name) {
         state.doc.name = name;
-        el.docTitle.textContent = name;
+        const t = findTab(state.doc.id);
+        if (t) t.name = name;
+        renderTabs();
+        saveTabs();
         DB.put('docs', state.doc);
       }
     } else if (act === 'help') showHelp();
@@ -1626,9 +2058,7 @@
       onOpen: () => { const i = $('#dlgInput'); i.focus(); i.select(); },
     });
     const n = parseInt(v, 10);
-    if (!n) return;
-    const pg = state.pages[clamp(n, 1, state.pages.length) - 1];
-    el.viewer.scrollTop = pg.el.offsetTop - 8;
+    if (n) goTo(n - 1);
   }
 
   // ================================================================ EVENTOS
@@ -1639,6 +2069,9 @@
       importFiles(files);
     });
     $('#btnNewNotebook').addEventListener('click', newNotebook);
+    $('#btnMerge').addEventListener('click', () => mergeDialog([]));
+    $('#btnTabAdd').addEventListener('click', openPicker);
+    el.btnSidebar.addEventListener('click', toggleSidebar);
 
     $('#btnBack').addEventListener('click', closeReader);
     el.btnUndo.addEventListener('click', undo);
@@ -1780,13 +2213,14 @@
     setTool(state.settings.tool);
     updateTouchAction();
     await refreshLibrary();
+    await restoreTabs();
     if ('serviceWorker' in navigator && location.protocol !== 'file:') {
       navigator.serviceWorker.register('sw.js').catch((e) => console.warn('SW', e));
     }
   }
 
   // Exponer para pruebas automatizadas
-  window.__anota = { state, openDoc, buildAnnotatedPdf, commit, setTool };
+  window.__anota = { state, openDoc, openInTab, buildAnnotatedPdf, commit, setTool, mergeDocs };
 
   init();
 })();

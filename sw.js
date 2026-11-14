@@ -1,5 +1,5 @@
 /* Service worker: permite usar la app sin conexión. */
-const VERSION = 'anota-pdf-v1';
+const VERSION = 'anota-pdf-v2';
 const SHELL = [
   './',
   'index.html',
