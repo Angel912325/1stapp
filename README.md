@@ -24,6 +24,8 @@ a pantalla completa y **sin conexión**. Todos los documentos y anotaciones se g
 - **Zoom** con pellizco de dos dedos (y desplazamiento con dos dedos con cualquier herramienta), o con los botones.
 - **Deshacer / rehacer** ilimitado durante la sesión (también ⌘Z / ⇧⌘Z con teclado).
 - **Guardado automático** de anotaciones, página y zoom.
+- **Actualización automática**: al abrir la app (o volver a ella) busca la última versión y se recarga sola.
+  El número de versión aparece al pie de la biblioteca.
 - **Exportar** un PDF con las anotaciones incrustadas para compartirlo (Archivos, correo, AirDrop…).
 - Añadir páginas en blanco al final de un documento.
 

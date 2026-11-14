@@ -15,6 +15,8 @@
   };
 
   // Límite de píxeles por canvas (Safari en iPad limita la memoria de canvas).
+  const APP_VERSION = '1.2.0';
+  const THUMB_VER = 2; // sube este número para regenerar las miniaturas de la biblioteca
   const MAX_CANVAS_PIXELS = 8_000_000;
   const MIN_ZOOM = 0.4, MAX_ZOOM = 5;
   const HL_ALPHA = 0.4;
@@ -225,17 +227,19 @@
       const card = document.createElement('div');
       card.className = 'lib-card';
       card.innerHTML = `
-        <div class="lib-thumb"></div>
+        <div class="lib-thumb"><img alt="" hidden></div>
         <div class="lib-info">
           <div class="lib-name"></div>
           <div class="lib-meta">${d.pages} pág. · ${fmtSize(d.size)} · ${fmtDate(d.opened || d.added)}</div>
+          ${d.lastPage > 0 ? `<div class="lib-reading">Leyendo: pág. ${d.lastPage + 1} de ${d.pages}</div>` : ''}
         </div>
         <div class="lib-card-actions">
           <button class="ren">Renombrar</button>
           <button class="del">Eliminar</button>
         </div>`;
       $('.lib-name', card).textContent = d.name;
-      if (d.thumb) $('.lib-thumb', card).style.backgroundImage = `url("${d.thumb}")`;
+      card.dataset.id = d.id;
+      setThumbImg($('.lib-thumb img', card), d.thumb);
       card.addEventListener('click', () => openInTab(d.id));
       $('.ren', card).addEventListener('click', async (e) => {
         e.stopPropagation();
@@ -263,18 +267,91 @@
       });
       el.libGrid.appendChild(card);
     }
+    regenThumbs();
   }
 
-  async function makeThumb(pdf) {
-    const page = await pdf.getPage(1);
+  function setThumbImg(img, src) {
+    if (!img) return;
+    if (src) { img.src = src; img.hidden = false; } else img.hidden = true;
+  }
+
+  /** Regenera en segundo plano las miniaturas antiguas o desactualizadas de la biblioteca. */
+  let regenRunning = false;
+  async function regenThumbs() {
+    if (regenRunning) return;
+    regenRunning = true;
+    try {
+      const docs = (await DB.all('docs')).filter((d) => (d.thumbVer || 0) < THUMB_VER);
+      for (const d of docs) {
+        if (el.library.hidden) break;
+        const buf = await DB.get('files', d.id);
+        if (!buf) continue;
+        const ann = await DB.get('annots', d.id);
+        const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buf.slice(0)), ...PDF_OPTS }).promise;
+        let thumb;
+        try { thumb = await makeThumb(pdf, ann && ann.pages && ann.pages[0]); } finally { pdf.destroy(); }
+        const fresh = await DB.get('docs', d.id);
+        if (!fresh) continue;
+        fresh.thumb = thumb;
+        fresh.thumbVer = THUMB_VER;
+        await DB.put('docs', fresh);
+        const card = el.libGrid.querySelector(`.lib-card[data-id="${CSS.escape(d.id)}"]`);
+        if (card) setThumbImg($('.lib-thumb img', card), thumb);
+      }
+    } catch (e) {
+      console.warn('miniaturas', e);
+    } finally {
+      regenRunning = false;
+    }
+  }
+
+  /**
+   * Renderiza una página (con sus anotaciones) como miniatura nítida: se dibuja al doble de
+   * resolución y se reduce con suavizado de alta calidad, lo que da un texto mucho más definido.
+   */
+  async function renderThumbCanvas(page, maxW, maxH, items, ss = 2) {
     const vp0 = page.getViewport({ scale: 1 });
-    const vp = page.getViewport({ scale: 320 / vp0.width });
-    const c = document.createElement('canvas');
-    c.width = Math.round(vp.width); c.height = Math.round(vp.height);
-    const ctx = c.getContext('2d');
-    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
-    await page.render({ canvasContext: ctx, viewport: vp }).promise;
-    const url = c.toDataURL('image/jpeg', 0.8);
+    const s = Math.min(maxW / vp0.width, maxH / vp0.height);
+    const W = Math.max(1, Math.round(vp0.width * s)), H = Math.max(1, Math.round(vp0.height * s));
+    const big = document.createElement('canvas');
+    big.width = W * ss; big.height = H * ss;
+    const bctx = big.getContext('2d', { alpha: false });
+    bctx.fillStyle = '#fff';
+    bctx.fillRect(0, 0, big.width, big.height);
+    await page.render({ canvasContext: bctx, viewport: page.getViewport({ scale: big.width / vp0.width }) }).promise;
+    if (items && items.length) {
+      const k = big.width / vp0.width;
+      bctx.setTransform(k, 0, 0, k, 0, 0);
+      bctx.globalCompositeOperation = 'multiply';
+      drawAnnots(bctx, items);
+    }
+    const out = document.createElement('canvas');
+    out.width = W; out.height = H;
+    const octx = out.getContext('2d');
+    octx.imageSmoothingEnabled = true;
+    octx.imageSmoothingQuality = 'high';
+    octx.drawImage(big, 0, 0, W, H);
+    big.width = big.height = 0;
+    return out;
+  }
+
+  /** Dibuja anotaciones (subrayados debajo, luego trazos y textos) en un contexto en puntos PDF. */
+  function drawAnnots(ctx, items) {
+    for (const it of items) if (it.tool === 'highlighter') drawItem(ctx, it);
+    for (const it of items) if (it.tool !== 'highlighter') drawItem(ctx, it);
+    for (const it of items) {
+      if (it.type !== 'text') continue;
+      ctx.fillStyle = it.color;
+      ctx.font = `${it.size}px Helvetica, Arial, sans-serif`;
+      it.text.split('\n').forEach((line, i) => ctx.fillText(line, it.x, it.y + it.size * (TEXT_BASELINE + 1.2 * i)));
+    }
+  }
+
+  /** Miniatura de la primera página para la biblioteca. */
+  async function makeThumb(pdf, items) {
+    const page = await pdf.getPage(1);
+    const c = await renderThumbCanvas(page, 440, 580, items);
+    const url = c.toDataURL('image/jpeg', 0.9);
     c.width = c.height = 0;
     return url;
   }
@@ -288,7 +365,7 @@
     const id = uid();
     const now = Date.now();
     await DB.put('files', buf, id);
-    await DB.put('docs', { id, name, size: buf.byteLength, pages, thumb, added: now, opened: 0 });
+    await DB.put('docs', { id, name, size: buf.byteLength, pages, thumb, thumbVer: thumb ? THUMB_VER : 0, added: now, opened: 0 });
     return id;
   }
 
@@ -388,6 +465,7 @@
       state.bytes = buf;
       state.pdf = pdf;
       state.annots = (ann && ann.pages) || {};
+      state.thumbDirty = false;
       state.undo = opts.undo || [];
       state.redo = opts.redo || [];
       state.sel = null;
@@ -510,6 +588,16 @@
       t.scrollTop = el.viewer.scrollTop; t.scrollLeft = el.viewer.scrollLeft;
     }
     await flushSave();
+    if (state.thumbDirty && state.pages[0]) {
+      // La primera página cambió: actualiza la miniatura de la biblioteca.
+      try {
+        const c = await renderThumbCanvas(state.pages[0].pdfPage, 440, 580, state.annots[0]);
+        state.doc.thumb = c.toDataURL('image/jpeg', 0.9);
+        state.doc.thumbVer = THUMB_VER;
+        c.width = c.height = 0;
+      } catch (e) { console.warn(e); }
+      state.thumbDirty = false;
+    }
     saveViewState();
   }
 
@@ -571,11 +659,11 @@
   function docRow(d, badge = '') {
     const row = document.createElement('div');
     row.className = 'doc-row';
-    row.innerHTML = `<div class="dr-thumb"></div>
+    row.innerHTML = `<div class="dr-thumb"><img alt="" hidden></div>
       <div class="dr-text"><div class="dr-name"></div><div class="dr-meta">${d.pages} pág. · ${fmtSize(d.size)}</div></div>
       ${badge ? `<span class="dr-badge">${escapeHtml(badge)}</span>` : ''}`;
     $('.dr-name', row).textContent = d.name;
-    if (d.thumb) $('.dr-thumb', row).style.backgroundImage = `url("${d.thumb}")`;
+    setThumbImg($('.dr-thumb img', row), d.thumb);
     return row;
   }
 
@@ -715,7 +803,14 @@
       }
       const bytes = await out.save();
       const newId = await addDocument(name, bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
-      if (Object.keys(annots).length) await DB.put('annots', { pages: annots, updated: Date.now() }, newId);
+      if (annots[0]) {
+        await DB.put('annots', { pages: annots, updated: Date.now() }, newId);
+        const rec = await DB.get('docs', newId);
+        rec.thumbVer = 0; // se regenerará con las anotaciones de la primera página
+        await DB.put('docs', rec);
+      } else if (Object.keys(annots).length) {
+        await DB.put('annots', { pages: annots, updated: Date.now() }, newId);
+      }
       busy(false);
       await refreshLibrary();
       await openInTab(newId);
@@ -728,7 +823,7 @@
   }
 
   // ================================================================ MINIATURAS
-  const THUMB_W = 100;
+  const THUMB_W = 120;
   let thumbIO = null;
   let activeThumb = -1;
 
@@ -793,20 +888,17 @@
 
   async function renderThumb(pg) {
     const t = pg.thumb;
-    const dpr = Math.min(2, window.devicePixelRatio || 1);
-    const base = document.createElement('canvas');
-    base.width = Math.round(THUMB_W * dpr);
-    base.height = Math.round(((THUMB_W * pg.h) / pg.w) * dpr);
-    const ctx = base.getContext('2d', { alpha: false });
-    ctx.fillStyle = '#fff';
-    ctx.fillRect(0, 0, base.width, base.height);
-    t.base = base; // marcada como en curso para no repetirla
+    const dpr = Math.min(3, window.devicePixelRatio || 1);
+    const pending = document.createElement('canvas');
+    t.base = pending; // marcada como en curso para no repetirla
+    let base = null;
     try {
-      await pg.pdfPage.render({ canvasContext: ctx, viewport: pg.pdfPage.getViewport({ scale: base.width / pg.w }) }).promise;
+      base = await renderThumbCanvas(pg.pdfPage, THUMB_W * dpr, Infinity, null);
     } catch (e) {
       console.warn(e);
     }
-    if (t.base !== base) { base.width = base.height = 0; return; }
+    if (t.base !== pending || !base) { if (base) base.width = base.height = 0; return; }
+    t.base = base;
     composeThumb(pg);
   }
 
@@ -822,15 +914,7 @@
     const k = c.width / pg.w;
     ctx.setTransform(k, 0, 0, k, 0, 0);
     ctx.globalCompositeOperation = 'multiply';
-    const items = state.annots[pg.index] || [];
-    for (const it of items) if (it.tool === 'highlighter') drawItem(ctx, it);
-    for (const it of items) if (it.tool !== 'highlighter') drawItem(ctx, it);
-    for (const it of items) {
-      if (it.type !== 'text') continue;
-      ctx.fillStyle = it.color;
-      ctx.font = `${it.size}px Helvetica, Arial, sans-serif`;
-      it.text.split('\n').forEach((line, i) => ctx.fillText(line, it.x, it.y + it.size * (TEXT_BASELINE + 1.2 * i)));
-    }
+    drawAnnots(ctx, state.annots[pg.index] || []);
   }
 
   function highlightThumb(index) {
@@ -1228,6 +1312,7 @@
     if (list.length) state.annots[index] = list; else delete state.annots[index];
     redrawPage(index);
     if (state.pages[index]) composeThumb(state.pages[index]);
+    if (index === 0) state.thumbDirty = true;
     if (state.sel && !findItem(state.sel.page, state.sel.id)) setSelection(null);
     else showSelection();
     scheduleSave();
@@ -2214,9 +2299,34 @@
     updateTouchAction();
     await refreshLibrary();
     await restoreTabs();
-    if ('serviceWorker' in navigator && location.protocol !== 'file:') {
-      navigator.serviceWorker.register('sw.js').catch((e) => console.warn('SW', e));
-    }
+    $('#appVersion').textContent = APP_VERSION;
+    setupUpdates();
+  }
+
+  /** Busca versiones nuevas al abrir la app y al volver a ella; si hay una, recarga sola. */
+  function setupUpdates() {
+    if (!('serviceWorker' in navigator) || location.protocol === 'file:') return;
+    const hadController = !!navigator.serviceWorker.controller;
+    let reloading = false;
+    navigator.serviceWorker.addEventListener('controllerchange', async () => {
+      if (!hadController || reloading) return;
+      reloading = true;
+      try { if (state.doc) await stashCurrent(); } catch (e) { console.error(e); }
+      sessionStorage.setItem('anota-updated', '1');
+      location.reload();
+    });
+    navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).then((reg) => {
+      reg.update().catch(() => {});
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') reg.update().catch(() => {});
+      });
+    }).catch((e) => console.warn('SW', e));
+    try {
+      if (sessionStorage.getItem('anota-updated')) {
+        sessionStorage.removeItem('anota-updated');
+        toast(`Anota PDF se ha actualizado a la versión ${APP_VERSION}`, 4000);
+      }
+    } catch (_) { /* nada */ }
   }
 
   // Exponer para pruebas automatizadas
