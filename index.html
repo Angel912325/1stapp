@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <title>Anota PDF</title>
+  <meta name="description" content="Lee PDFs y anótalos con el dedo o el Apple Pencil">
+  <meta name="theme-color" content="#1f2937">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Anota PDF">
+  <link rel="apple-touch-icon" href="icons/icon-180.png">
+  <link rel="icon" type="image/png" href="icons/icon-192.png">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- ============ BIBLIOTECA ============ -->
+  <section id="library" class="screen">
+    <header class="lib-header">
+      <h1>Mis PDFs</h1>
+      <div class="lib-actions">
+        <button id="btnNewNotebook" class="btn">Nueva libreta</button>
+        <label class="btn primary">
+          Abrir PDF
+          <input id="fileInput" type="file" accept="application/pdf,.pdf" multiple hidden>
+        </label>
+      </div>
+    </header>
+    <div id="libEmpty" class="lib-empty" hidden>
+      <div class="lib-empty-icon">📄</div>
+      <p>Todavía no tienes documentos.</p>
+      <p class="muted">Pulsa <b>Abrir PDF</b> para importar un archivo desde Archivos, iCloud Drive, etc.,
+        o crea una <b>Nueva libreta</b> en blanco.</p>
+    </div>
+    <div id="libGrid" class="lib-grid"></div>
+    <p class="lib-foot muted">Todo se guarda solo en este dispositivo. Para instalar la app: en Safari pulsa
+      <b>Compartir → Añadir a pantalla de inicio</b>.</p>
+  </section>
+
+  <!-- ============ LECTOR ============ -->
+  <section id="reader" class="screen" hidden>
+    <header class="topbar">
+      <button id="btnBack" class="icon-btn" title="Biblioteca" aria-label="Volver a la biblioteca">
+        <svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></svg>
+      </button>
+      <div id="docTitle" class="doc-title"></div>
+      <span id="saveState" class="save-state"></span>
+      <div class="spacer"></div>
+      <button id="btnUndo" class="icon-btn" title="Deshacer" aria-label="Deshacer">
+        <svg viewBox="0 0 24 24"><path d="M9 14L4 9l5-5"/><path d="M4 9h10a6 6 0 010 12h-3"/></svg>
+      </button>
+      <button id="btnRedo" class="icon-btn" title="Rehacer" aria-label="Rehacer">
+        <svg viewBox="0 0 24 24"><path d="M15 14l5-5-5-5"/><path d="M20 9H10a6 6 0 000 12h3"/></svg>
+      </button>
+      <span class="sep"></span>
+      <button id="btnZoomOut" class="icon-btn" title="Alejar" aria-label="Alejar">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M8 11h6M20 20l-4-4"/></svg>
+      </button>
+      <button id="btnZoomFit" class="zoom-label" title="Ajustar al ancho">100%</button>
+      <button id="btnZoomIn" class="icon-btn" title="Acercar" aria-label="Acercar">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M8 11h6M11 8v6M20 20l-4-4"/></svg>
+      </button>
+      <span class="sep"></span>
+      <button id="btnPage" class="page-label" title="Ir a página">1 / 1</button>
+      <button id="btnMore" class="icon-btn" title="Más opciones" aria-label="Más opciones">
+        <svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.3"/><circle cx="12" cy="12" r="1.3"/><circle cx="19" cy="12" r="1.3"/></svg>
+      </button>
+      <button id="btnExport" class="btn primary small" title="Exportar PDF anotado">Exportar</button>
+    </header>
+
+    <nav class="toolbar" id="toolbar">
+      <div class="tools">
+        <button class="tool" data-tool="pan" title="Mano: desplazar y leer">
+          <svg viewBox="0 0 24 24"><path d="M8 13V5.5a1.5 1.5 0 013 0V12M11 11V4a1.5 1.5 0 013 0v7M14 11V5.5a1.5 1.5 0 013 0V12M17 9.5a1.5 1.5 0 013 0V15a7 7 0 01-7 7h-1a7 7 0 01-5.6-2.8L3.5 15a1.6 1.6 0 012.4-2L8 15"/></svg>
+          <span>Mano</span>
+        </button>
+        <button class="tool" data-tool="select" title="Seleccionar y mover anotaciones">
+          <svg viewBox="0 0 24 24"><path d="M5 3l14 8-6 1.5L10 19z"/></svg>
+          <span>Selección</span>
+        </button>
+        <button class="tool" data-tool="pen" title="Bolígrafo">
+          <svg viewBox="0 0 24 24"><path d="M4 20l1-4L16 5l3 3L8 19z"/><path d="M14 7l3 3"/></svg>
+          <span>Bolígrafo</span>
+        </button>
+        <button class="tool" data-tool="highlighter" title="Subrayador">
+          <svg viewBox="0 0 24 24"><path d="M9 15l-3 3h5l1-1"/><path d="M8.5 13.5l7-9 4 4-9 7z"/><path d="M4 21h16" class="hl-line"/></svg>
+          <span>Subrayador</span>
+        </button>
+        <button class="tool" data-tool="eraser" title="Borrador">
+          <svg viewBox="0 0 24 24"><path d="M8 20h12"/><path d="M4.5 15.5l9-9a2 2 0 012.8 0l3.2 3.2a2 2 0 010 2.8L13 19H8z"/><path d="M9 11l5 5"/></svg>
+          <span>Borrador</span>
+        </button>
+        <button class="tool" data-tool="text" title="Texto">
+          <svg viewBox="0 0 24 24"><path d="M5 6V4h14v2M12 4v16M9 20h6"/></svg>
+          <span>Texto</span>
+        </button>
+        <button class="tool" data-tool="shape" title="Formas">
+          <svg viewBox="0 0 24 24"><rect x="3" y="3" width="10" height="10" rx="1"/><circle cx="16" cy="16" r="5"/></svg>
+          <span>Formas</span>
+        </button>
+      </div>
+
+      <div class="options" id="options">
+        <div class="shape-kinds" id="shapeKinds">
+          <button class="kind" data-kind="line" title="Línea"><svg viewBox="0 0 24 24"><path d="M5 19L19 5"/></svg></button>
+          <button class="kind" data-kind="arrow" title="Flecha"><svg viewBox="0 0 24 24"><path d="M5 19L19 5M10 5h9v9"/></svg></button>
+          <button class="kind" data-kind="rect" title="Rectángulo"><svg viewBox="0 0 24 24"><rect x="4" y="6" width="16" height="12" rx="1"/></svg></button>
+          <button class="kind" data-kind="ellipse" title="Elipse"><svg viewBox="0 0 24 24"><ellipse cx="12" cy="12" rx="8" ry="6"/></svg></button>
+        </div>
+        <div class="colors" id="colors"></div>
+        <label class="custom-color" title="Color personalizado">
+          <input type="color" id="customColor" value="#1a1a1a">
+        </label>
+        <div class="width-ctl" id="widthCtl">
+          <span class="width-preview" id="widthPreview"><i></i></span>
+          <input type="range" id="widthRange" min="1" max="20" step="0.5" value="2">
+          <span class="width-value" id="widthValue">2</span>
+        </div>
+        <div class="sel-actions" id="selActions" hidden>
+          <button class="btn small" id="btnSelEdit" hidden>Editar texto</button>
+          <button class="btn small" id="btnSelDup">Duplicar</button>
+          <button class="btn small danger" id="btnSelDel">Eliminar</button>
+        </div>
+        <div class="spacer"></div>
+        <button class="toggle" id="btnPencilOnly" title="Solo Apple Pencil: el dedo desplaza la página y el lápiz dibuja">
+          <svg viewBox="0 0 24 24"><path d="M4 20l1-4L16 5l3 3L8 19z"/></svg>
+          <span>Solo lápiz</span>
+        </button>
+      </div>
+    </nav>
+
+    <main id="viewer" class="viewer">
+      <div id="pages" class="pages"></div>
+    </main>
+    <div id="eraserCursor" class="eraser-cursor" hidden></div>
+  </section>
+
+  <!-- Menú "más" -->
+  <div id="moreMenu" class="menu" hidden>
+    <button data-action="addPage">Añadir página en blanco al final</button>
+    <button data-action="clearPage">Borrar anotaciones de esta página</button>
+    <button data-action="rename">Renombrar documento</button>
+    <button data-action="help">Ayuda y gestos</button>
+  </div>
+
+  <!-- Diálogo genérico -->
+  <div id="dialog" class="dialog-backdrop" hidden>
+    <div class="dialog">
+      <h2 id="dlgTitle"></h2>
+      <div id="dlgBody"></div>
+      <div class="dialog-actions" id="dlgActions"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+  <div id="busy" class="busy" hidden><div class="spinner"></div><span id="busyText">Cargando…</span></div>
+
+  <script src="vendor/pdfjs/pdf.min.js"></script>
+  <script src="vendor/pdf-lib.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
